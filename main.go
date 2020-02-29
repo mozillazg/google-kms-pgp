@@ -257,11 +257,17 @@ func runSign(options options) error {
 		// Get ready to sign
 		var (
 			writeCloser io.WriteCloser
+			armorWriter io.WriteCloser
 			addNewline  bool
 		)
 		if options.clearSign {
 			addNewline = true
 			writeCloser, err = clearsign.Encode(output, entity.PrivateKey, &cfg)
+		} else if options.armor {
+			armorWriter, err = armor.Encode(output, openpgp.SignatureType, make(map[string]string))
+			if err == nil {
+				writeCloser, err = openpgp.Sign(armorWriter, entity, fileHints, &cfg)
+			}
 		} else {
 			writeCloser, err = openpgp.Sign(output, entity, fileHints, &cfg)
 		}
@@ -274,6 +280,9 @@ func runSign(options options) error {
 
 		// Always try to close
 		closeErr := writeCloser.Close()
+		if armorWriter != nil {
+			armorWriter.Close()
+		}
 
 		if copyErr != nil {
 			return copyErr
