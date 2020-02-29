@@ -27,7 +27,12 @@ import (
 
 	"github.com/pkg/errors"
 
-	cloudkms "google.golang.org/api/cloudkms/v1"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/kms"
+)
+
+const (
+	RsaPkcs1Sha256 = "RSA_PKCS1_SHA_256"
+	Https          = "HTTPS"
 )
 
 // Signer extends crypto.Signer to provide more key metadata.
@@ -37,30 +42,39 @@ type Signer interface {
 	CreationTime() time.Time
 }
 
-// New returns a crypto.Signer backed by the named Google Cloud KMS key.
-func New(api *cloudkms.Service, name string) (Signer, error) {
-	metadata, err := api.Projects.Locations.KeyRings.CryptoKeys.CryptoKeyVersions.Get(name).Do()
+// New returns a crypto.Signer backed by the named Alibaba Cloud KMS key.
+func New(api *kms.Client, keyID, keyVersionID string) (Signer, error) {
+	reqDescribeKey := kms.CreateDescribeKeyRequest()
+	reqDescribeKey.Scheme = Https
+	reqDescribeKey.KeyId = keyID
+	metadata, err := api.DescribeKey(reqDescribeKey)
 	if err != nil {
-		return nil, errors.WithMessage(err, "could not get key version from Google Cloud KMS API")
+		return nil, errors.WithMessage(err, "could not get key version from Alibaba Cloud KMS API")
 	}
-	switch metadata.Algorithm {
-	case "RSA_SIGN_PKCS1_2048_SHA256":
-	case "RSA_SIGN_PKCS1_3072_SHA256":
-	case "RSA_SIGN_PKCS1_4096_SHA256":
+	keyMetadata := metadata.KeyMetadata
+	if keyMetadata.KeyUsage != "SIGN/VERIFY" {
+		return nil, errors.Errorf("key usage should be SIGN/VERIFY instead of %s", keyMetadata.KeyUsage)
+	}
+	switch keyMetadata.KeySpec {
+	case "RSA_2048":
 	default:
-		return nil, fmt.Errorf("unsupported key algorithm %q", metadata.Algorithm)
+		return nil, fmt.Errorf("unsupported key algorithm %q", keyMetadata.KeySpec)
 	}
 
-	creationTime, err := time.Parse(time.RFC3339Nano, metadata.CreateTime)
+	creationTime, err := time.Parse(time.RFC3339, keyMetadata.CreationDate)
 	if err != nil {
 		return nil, errors.WithMessage(err, "could not parse key creation timestamp")
 	}
 
-	res, err := api.Projects.Locations.KeyRings.CryptoKeys.CryptoKeyVersions.GetPublicKey(name).Do()
+	reqGetPublicKey := kms.CreateGetPublicKeyRequest()
+	reqGetPublicKey.Scheme = Https
+	reqGetPublicKey.KeyId = keyID
+	reqGetPublicKey.KeyVersionId = keyVersionID
+	resp, err := api.GetPublicKey(reqGetPublicKey)
 	if err != nil {
-		return nil, errors.WithMessage(err, "could not get public key from Google Cloud KMS API")
+		return nil, errors.WithMessage(err, "could not get public key from Alibaba Cloud KMS API")
 	}
-	block, _ := pem.Decode([]byte(res.Pem))
+	block, _ := pem.Decode([]byte(resp.PublicKey))
 	if block == nil || block.Type != "PUBLIC KEY" {
 		return nil, errors.WithMessage(err, "could not decode public key PEM")
 	}
@@ -74,15 +88,17 @@ func New(api *cloudkms.Service, name string) (Signer, error) {
 	}
 	return &kmsSigner{
 		api:          api,
-		name:         name,
+		keyID:        keyID,
+		keyVersionID: keyVersionID,
 		pubkey:       *pubkeyRSA,
 		creationTime: creationTime,
 	}, nil
 }
 
 type kmsSigner struct {
-	api          *cloudkms.Service
-	name         string
+	api          *kms.Client
+	keyID        string
+	keyVersionID string
 	pubkey       rsa.PublicKey
 	creationTime time.Time
 }
@@ -103,20 +119,20 @@ func (k *kmsSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) 
 	if len(digest) != sha256.Size {
 		return nil, fmt.Errorf("input digest must be valid SHA-256 hash")
 	}
-	sig, err := k.api.Projects.Locations.KeyRings.CryptoKeys.CryptoKeyVersions.AsymmetricSign(
-		k.name,
-		&cloudkms.AsymmetricSignRequest{
-			Digest: &cloudkms.Digest{
-				Sha256: base64.StdEncoding.EncodeToString(digest),
-			},
-		},
-	).Do()
+
+	reqSign := kms.CreateAsymmetricSignRequest()
+	reqSign.Scheme = Https
+	reqSign.KeyId = k.keyID
+	reqSign.KeyVersionId = k.keyVersionID
+	reqSign.Digest = base64.StdEncoding.EncodeToString(digest)
+	reqSign.Algorithm = RsaPkcs1Sha256
+	sig, err := k.api.AsymmetricSign(reqSign)
 	if err != nil {
-		return nil, errors.Wrap(err, "error signing with Google Cloud KMS")
+		return nil, errors.Wrap(err, "error signing with Alibaba Cloud KMS")
 	}
-	res, err := base64.StdEncoding.DecodeString(sig.Signature)
+	res, err := base64.StdEncoding.DecodeString(sig.Value)
 	if err != nil {
-		return nil, errors.WithMessage(err, "invalid Base64 response from Google Cloud KMS AsymmetricSign endpoint")
+		return nil, errors.WithMessage(err, "invalid Base64 response from Ailbaba Cloud KMS AsymmetricSign endpoint")
 	}
 	return res, nil
 }

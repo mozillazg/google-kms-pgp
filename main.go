@@ -15,26 +15,25 @@
 package main
 
 import (
-	"context"
 	"crypto"
 	_ "crypto/sha256"
 	"fmt"
 	"io"
 	"os"
 
-	"golang.org/x/crypto/openpgp/clearsign"
-	"golang.org/x/crypto/openpgp/s2k"
-
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/kms"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/crypto/openpgp"
 	"golang.org/x/crypto/openpgp/armor"
+	"golang.org/x/crypto/openpgp/clearsign"
 	"golang.org/x/crypto/openpgp/packet"
-	"golang.org/x/oauth2/google"
-	cloudkms "google.golang.org/api/cloudkms/v1"
+	"golang.org/x/crypto/openpgp/s2k"
 
 	"github.com/heptiolabs/google-kms-pgp/kmssigner"
 )
+
+const envRegionID = "ALIBABA_CLOUD_REGION_ID"
 
 var (
 	cfg = packet.Config{}
@@ -43,17 +42,15 @@ var (
 type options struct {
 	export            bool
 	armor             bool
-	localUser         string
-	defaultKey        string
-	key               string
+	keyID             string
+	keyVersionID      string
 	detachedSignature bool
 	sign              bool
 	clearSign         bool
 	input             string
 	output            string
-	name              string
-	comment           string
-	email             string
+
+	kms *kms.Client
 }
 
 func main() {
@@ -65,48 +62,38 @@ func main() {
 
 	// export options
 	pflag.BoolVar(&options.export, "export", options.export, "export public key")
-	pflag.StringVar(&options.name, "name", options.name, "name associated with the key")
-	pflag.StringVar(&options.comment, "comment", options.comment, "comment associated with the key")
-	pflag.StringVar(&options.email, "email", options.email, "email associated with the key")
 
 	// sign options
 	pflag.BoolVarP(&options.sign, "sign", "s", options.sign, "sign a message")
 	pflag.BoolVar(&options.clearSign, "clearsign", options.sign, "sign a message in clear text")
-	pflag.StringVarP(&options.localUser, "local-user", "u", options.localUser, "name of key to sign with")
-	pflag.StringVar(&options.defaultKey, "default-key", options.defaultKey, "name of key to sign with")
+	pflag.StringVarP(&options.keyID, "key-id", "", options.keyID, "id of key to sign with")
+	pflag.StringVar(&options.keyVersionID, "key-version-id", options.keyVersionID, "version id of key to sign with")
 	pflag.BoolVarP(&options.detachedSignature, "detach-sign", "b", options.detachedSignature, "make a detached signature")
 
 	pflag.CommandLine.ParseErrorsWhitelist.UnknownFlags = true
 	pflag.Parse()
 
-	// local-user and default-key are mutually exclusive, for our purposes
-	if options.localUser != "" && options.defaultKey != "" {
-		fmt.Fprintln(os.Stderr, "you may set either local-user or default-key, but not both")
+	if options.keyID == "" || options.keyVersionID == "" {
+		fmt.Fprintln(os.Stderr, "both key-id and key-version-id are required")
 		os.Exit(1)
 	}
-	if options.localUser != "" {
-		options.key = options.localUser
-	}
-	if options.defaultKey != "" {
-		options.key = options.defaultKey
-	}
 
-	var err error
+	regionID := os.Getenv(envRegionID)
+	if regionID == "" {
+		fmt.Fprintf(os.Stderr, "please set region id via setting env %s\n", envRegionID)
+		os.Exit(1)
+	}
+	client, err := kms.NewClientWithProvider(regionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "could not create Alibaba Cloud KMS client: %s\n", err)
+		os.Exit(1)
+	}
+	options.kms = client
 
 	switch {
 	case options.export:
-		args := pflag.Args()
-		if len(args) != 1 {
-			usage("--export --name NAME [--comment COMMENT] --email EMAIL [--armor] [--output OUTPUT] KEY")
-		}
-
-		options.key = args[0]
 		err = runExport(options)
 	case options.sign, options.clearSign, options.detachedSignature:
-		if options.key == "" {
-			usage("--sign|--clearsign --local-user KEY [--detach-sign] [--armor] [--output OUTPUT] [INPUT]")
-		}
-
 		args := pflag.Args()
 		if len(args) == 1 {
 			options.input = args[0]
@@ -129,22 +116,12 @@ func usage(msg string) {
 }
 
 func runExport(options options) error {
-	if options.key == "" {
-		return errors.New("key is required")
-	}
-	if options.name == "" {
-		return errors.New("name is required")
-	}
-	if options.email == "" {
-		return errors.New("email is required")
-	}
-
-	entity, err := getEntity(options.key)
+	entity, err := getEntity(options)
 	if err != nil {
 		return err
 	}
 
-	uid := packet.NewUserId(options.name, options.comment, options.email)
+	uid := packet.NewUserId(fmt.Sprintf("%s:%s", options.keyID, options.keyVersionID), "", "")
 	if uid == nil {
 		return errors.Errorf("could not generate PGP user ID metadata")
 	}
@@ -209,11 +186,7 @@ func runExport(options options) error {
 }
 
 func runSign(options options) error {
-	if options.key == "" {
-		return errors.New("key is required")
-	}
-
-	entity, err := getEntity(options.key)
+	entity, err := getEntity(options)
 	if err != nil {
 		return err
 	}
@@ -317,23 +290,9 @@ func runSign(options options) error {
 	return nil
 }
 
-func getEntity(key string) (*openpgp.Entity, error) {
-	if key == "" {
-		return nil, errors.New("key is required")
-	}
-	// Connect to the Google Cloud KMS API
-	ctx := context.Background()
-	oauthClient, err := google.DefaultClient(ctx, cloudkms.CloudPlatformScope)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not create Google Cloud OAuth client")
-	}
-	svc, err := cloudkms.New(oauthClient)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not create Google Cloud KMS client")
-	}
-
+func getEntity(options options) (*openpgp.Entity, error) {
 	// Initialize a crypto.Signer backed by the configured Cloud KMS key.
-	signer, err := kmssigner.New(svc, key)
+	signer, err := kmssigner.New(options.kms, options.keyID, options.keyVersionID)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get KMS signer")
 	}

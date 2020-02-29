@@ -2,3 +2,6 @@
 *.pub
 *.json
 *.txt
+test.sh
+aliyun-kms-pgp
+google-kms-pgp
